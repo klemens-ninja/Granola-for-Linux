@@ -1,0 +1,7 @@
+# Granola's code belongs to Granola
+*.dmg
+app.asar
+app.asar.unpacked/
+
+# downloaded Electron runtimes and 7zz
+.cache/

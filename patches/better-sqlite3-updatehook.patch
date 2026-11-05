@@ -1,0 +1,334 @@
+--- a/deps/defines.gypi
++++ b/deps/defines.gypi
+@@ -15,6 +15,7 @@
+     'SQLITE_DEFAULT_MEMSTATUS=0',
+     'SQLITE_DEFAULT_WAL_SYNCHRONOUS=1',
+     'SQLITE_DQS=0',
++    'SQLITE_ENABLE_BYTECODE_VTAB',
+     'SQLITE_ENABLE_COLUMN_METADATA',
+     'SQLITE_ENABLE_DBSTAT_VTAB',
+     'SQLITE_ENABLE_DESERIALIZE',
+--- a/src/better_sqlite3.cpp
++++ b/src/better_sqlite3.cpp
+@@ -57,7 +57,7 @@
+ 
+ 	// Initialize addon instance.
+ 	Addon* addon = new Addon(isolate);
+-	v8::Local<v8::External> data = v8::External::New(isolate, addon);
++	v8::Local<v8::External> data = NEW_EXTERNAL(isolate, addon);
+ 	node::AddEnvironmentCleanupHook(isolate, Addon::Cleanup, addon);
+ 
+ 	// Create and export native-backed classes and functions.
+--- a/src/objects/database.cpp
++++ b/src/objects/database.cpp
+@@ -46,6 +46,8 @@
+ 		for (Backup* backup : backups) backup->CloseHandles();
+ 		stmts.clear();
+ 		backups.clear();
++		sqlite3_update_hook(db_handle, NULL, NULL);
++		update_hook.Reset();
+ 		int status = sqlite3_close(db_handle);
+ 		assert(status == SQLITE_OK); ((void)status);
+ 	}
+@@ -138,6 +140,7 @@
+ 	SetPrototypeMethod(isolate, data, t, "close", JS_close);
+ 	SetPrototypeMethod(isolate, data, t, "defaultSafeIntegers", JS_defaultSafeIntegers);
+ 	SetPrototypeMethod(isolate, data, t, "unsafeMode", JS_unsafeMode);
++	SetPrototypeMethod(isolate, data, t, "updateHook", JS_updateHook);
+ 	SetPrototypeGetter(isolate, data, t, "open", JS_open);
+ 	SetPrototypeGetter(isolate, data, t, "inTransaction", JS_inTransaction);
+ 	return t->GetFunction(OnlyContext).ToLocalChecked();
+@@ -447,6 +450,39 @@
+ 	sqlite3_db_config(db->db_handle, SQLITE_DBCONFIG_DEFENSIVE, static_cast<int>(!db->unsafe_mode), NULL);
+ }
+ 
++// updateHook(fn | null): calls fn(operation, databaseName, tableName, rowid)
++// after every row INSERT/UPDATE/DELETE on this connection. Pass null/undefined
++// to remove the hook. Exceptions thrown by fn are swallowed.
++NODE_METHOD(Database::JS_updateHook) {
++	Database* db = Unwrap<Database>(info.This());
++	if (!db->open) return ThrowTypeError("The database connection is not open");
++	if (info.Length() == 0 || info[0]->IsNull() || info[0]->IsUndefined()) {
++		sqlite3_update_hook(db->db_handle, NULL, NULL);
++		db->update_hook.Reset();
++		return;
++	}
++	if (!info[0]->IsFunction()) return ThrowTypeError("Expected first argument to be a function");
++	db->update_hook.Reset(info.GetIsolate(), info[0].As<v8::Function>());
++	sqlite3_update_hook(db->db_handle, UpdateHookCallback, db);
++}
++
++void Database::UpdateHookCallback(void* ctx, int op, const char* db_name, const char* table, sqlite3_int64 rowid) {
++	Database* db = static_cast<Database*>(ctx);
++	if (db->update_hook.IsEmpty()) return;
++	v8::Isolate* isolate = v8::Isolate::GetCurrent();
++	v8::HandleScope scope(isolate);
++	v8::Local<v8::Context> ctx_ = isolate->GetCurrentContext();
++	const char* op_name = op == SQLITE_INSERT ? "insert" : op == SQLITE_DELETE ? "delete" : "update";
++	v8::Local<v8::Value> args[4] = {
++		StringFromUtf8(isolate, op_name, -1),
++		StringFromUtf8(isolate, db_name, -1),
++		StringFromUtf8(isolate, table, -1),
++		v8::Number::New(isolate, static_cast<double>(rowid))
++	};
++	v8::TryCatch try_catch(isolate);
++	(void)db->update_hook.Get(isolate)->Call(ctx_, v8::Undefined(isolate), 4, args);
++}
++
+ NODE_GETTER(Database::JS_open) {
+ 	info.GetReturnValue().Set(Unwrap<Database>(PROPERTY_HOLDER(info))->open);
+ }
+--- a/src/objects/database.hpp
++++ b/src/objects/database.hpp
+@@ -1,105 +1,108 @@
+-class Database : public node::ObjectWrap {
+-public:
+-
+-	~Database();
+-
+-	// Whenever this is used, addon->dbs.erase() must be invoked beforehand.
+-	void CloseHandles();
+-
+-	// Used to support ordered containers.
+-	class CompareDatabase { public:
+-		inline bool operator() (Database const * const a, Database const * const b) const {
+-			return a < b;
+-		}
+-	};
+-	class CompareStatement { public:
+-		inline bool operator() (Statement const * const a, Statement const * const b) const {
+-			return Statement::Compare(a, b);
+-		}
+-	};
+-	class CompareBackup { public:
+-		inline bool operator() (Backup const * const a, Backup const * const b) const {
+-			return Backup::Compare(a, b);
+-		}
+-	};
+-
+-	// Proper error handling logic for when an sqlite3 operation fails.
+-	void ThrowDatabaseError();
+-	static void ThrowSqliteError(Addon* addon, sqlite3* db_handle);
+-	static void ThrowSqliteError(Addon* addon, const char* message, int code);
+-
+-	// Allows Statements to log their executed SQL.
+-	bool Log(v8::Isolate* isolate, sqlite3_stmt* handle);
+-
+-	// Allow Statements to manage themselves when created and garbage collected.
+-	inline void AddStatement(Statement* stmt) { stmts.insert(stmts.end(), stmt); }
+-	inline void RemoveStatement(Statement* stmt) { stmts.erase(stmt); }
+-
+-	// Allow Backups to manage themselves when created and garbage collected.
+-	inline void AddBackup(Backup* backup) { backups.insert(backups.end(), backup); }
+-	inline void RemoveBackup(Backup* backup) { backups.erase(backup); }
+-
+-	// A view for Statements to see and modify Database state.
+-	// The order of these fields must exactly match their actual order.
+-	struct State {
+-		const bool open;
+-		bool busy;
+-		const bool safe_ints;
+-		const bool unsafe_mode;
+-		bool was_js_error;
+-		const bool has_logger;
+-		unsigned short iterators;
+-		Addon* const addon;
+-	};
+-
+-	inline State* GetState() { return reinterpret_cast<State*>(&open); }
+-	inline sqlite3* GetHandle() { return db_handle; }
+-	inline Addon* GetAddon() { return addon; }
+-
+-	static INIT(Init);
+-
+-private:
+-
+-	explicit Database(
+-		v8::Isolate* isolate,
+-		Addon* addon,
+-		sqlite3* db_handle,
+-		v8::Local<v8::Value> logger
+-	);
+-
+-	static NODE_METHOD(JS_new);
+-	static NODE_METHOD(JS_prepare);
+-	static NODE_METHOD(JS_key);
+-	static NODE_METHOD(JS_rekey);
+-	static NODE_METHOD(JS_exec);
+-	static NODE_METHOD(JS_backup);
+-	static NODE_METHOD(JS_serialize);
+-	static NODE_METHOD(JS_function);
+-	static NODE_METHOD(JS_aggregate);
+-	static NODE_METHOD(JS_table);
+-	static NODE_METHOD(JS_loadExtension);
+-	static NODE_METHOD(JS_close);
+-	static NODE_METHOD(JS_defaultSafeIntegers);
+-	static NODE_METHOD(JS_unsafeMode);
+-	static NODE_GETTER(JS_open);
+-	static NODE_GETTER(JS_inTransaction);
+-
+-	static bool Deserialize(v8::Local<v8::Object> buffer, Addon* addon, sqlite3* db_handle, bool readonly);
+-	static void FreeSerialization(char* data, void* _);
+-
+-	static const int MAX_BUFFER_SIZE;
+-	static const int MAX_STRING_SIZE;
+-
+-	sqlite3* const db_handle;
+-	bool open;
+-	bool busy;
+-	bool safe_ints;
+-	bool unsafe_mode;
+-	bool was_js_error;
+-	const bool has_logger;
+-	unsigned short iterators;
+-	Addon* const addon;
+-	const v8::Global<v8::Value> logger;
+-	std::set<Statement*, CompareStatement> stmts;
+-	std::set<Backup*, CompareBackup> backups;
+-};
++class Database : public node::ObjectWrap {
++public:
++
++	~Database();
++
++	// Whenever this is used, addon->dbs.erase() must be invoked beforehand.
++	void CloseHandles();
++
++	// Used to support ordered containers.
++	class CompareDatabase { public:
++		inline bool operator() (Database const * const a, Database const * const b) const {
++			return a < b;
++		}
++	};
++	class CompareStatement { public:
++		inline bool operator() (Statement const * const a, Statement const * const b) const {
++			return Statement::Compare(a, b);
++		}
++	};
++	class CompareBackup { public:
++		inline bool operator() (Backup const * const a, Backup const * const b) const {
++			return Backup::Compare(a, b);
++		}
++	};
++
++	// Proper error handling logic for when an sqlite3 operation fails.
++	void ThrowDatabaseError();
++	static void ThrowSqliteError(Addon* addon, sqlite3* db_handle);
++	static void ThrowSqliteError(Addon* addon, const char* message, int code);
++
++	// Allows Statements to log their executed SQL.
++	bool Log(v8::Isolate* isolate, sqlite3_stmt* handle);
++
++	// Allow Statements to manage themselves when created and garbage collected.
++	inline void AddStatement(Statement* stmt) { stmts.insert(stmts.end(), stmt); }
++	inline void RemoveStatement(Statement* stmt) { stmts.erase(stmt); }
++
++	// Allow Backups to manage themselves when created and garbage collected.
++	inline void AddBackup(Backup* backup) { backups.insert(backups.end(), backup); }
++	inline void RemoveBackup(Backup* backup) { backups.erase(backup); }
++
++	// A view for Statements to see and modify Database state.
++	// The order of these fields must exactly match their actual order.
++	struct State {
++		const bool open;
++		bool busy;
++		const bool safe_ints;
++		const bool unsafe_mode;
++		bool was_js_error;
++		const bool has_logger;
++		unsigned short iterators;
++		Addon* const addon;
++	};
++
++	inline State* GetState() { return reinterpret_cast<State*>(&open); }
++	inline sqlite3* GetHandle() { return db_handle; }
++	inline Addon* GetAddon() { return addon; }
++
++	static INIT(Init);
++
++private:
++
++	explicit Database(
++		v8::Isolate* isolate,
++		Addon* addon,
++		sqlite3* db_handle,
++		v8::Local<v8::Value> logger
++	);
++
++	static NODE_METHOD(JS_new);
++	static NODE_METHOD(JS_prepare);
++	static NODE_METHOD(JS_key);
++	static NODE_METHOD(JS_rekey);
++	static NODE_METHOD(JS_exec);
++	static NODE_METHOD(JS_backup);
++	static NODE_METHOD(JS_serialize);
++	static NODE_METHOD(JS_function);
++	static NODE_METHOD(JS_aggregate);
++	static NODE_METHOD(JS_table);
++	static NODE_METHOD(JS_loadExtension);
++	static NODE_METHOD(JS_close);
++	static NODE_METHOD(JS_defaultSafeIntegers);
++	static NODE_METHOD(JS_unsafeMode);
++	static NODE_METHOD(JS_updateHook);
++	static void UpdateHookCallback(void* ctx, int op, const char* db_name, const char* table, sqlite3_int64 rowid);
++	static NODE_GETTER(JS_open);
++	static NODE_GETTER(JS_inTransaction);
++
++	static bool Deserialize(v8::Local<v8::Object> buffer, Addon* addon, sqlite3* db_handle, bool readonly);
++	static void FreeSerialization(char* data, void* _);
++
++	static const int MAX_BUFFER_SIZE;
++	static const int MAX_STRING_SIZE;
++
++	sqlite3* const db_handle;
++	bool open;
++	bool busy;
++	bool safe_ints;
++	bool unsafe_mode;
++	bool was_js_error;
++	const bool has_logger;
++	unsigned short iterators;
++	Addon* const addon;
++	const v8::Global<v8::Value> logger;
++	v8::Global<v8::Function> update_hook;
++	std::set<Statement*, CompareStatement> stmts;
++	std::set<Backup*, CompareBackup> backups;
++};
+--- a/src/util/macros.cpp
++++ b/src/util/macros.cpp
+@@ -4,7 +4,7 @@
+ #define NODE_GETTER(name) void name(v8::Local<v8::Name> _, const v8::PropertyCallbackInfo<v8::Value>& info)
+ #define INIT(name) v8::Local<v8::Function> name(v8::Isolate* isolate, v8::Local<v8::External> data)
+ 
+-#if defined(V8_MAJOR_VERSION) && V8_MAJOR_VERSION >= 13
++#if defined(V8_MAJOR_VERSION) && V8_MAJOR_VERSION >= 13 && V8_MAJOR_VERSION < 15
+ // v8::Object::GetPrototype has been deprecated. See http://crbug.com/333672197
+ #define GET_PROTOTYPE(obj) ((obj)->GetPrototypeV2())
+ #else
+@@ -18,7 +18,10 @@
+ //   V8_INLINE Local<Object> Holder() const;
+ //   V8_DEPRECATE_SOON("Use Holder().")
+ //   V8_INLINE Local<Object> HolderV2() const;
+-#if defined(V8_MAJOR_VERSION) && V8_MAJOR_VERSION >= 13
++#if defined(V8_MAJOR_VERSION) && V8_MAJOR_VERSION >= 15
++// V8 15 restored Holder() and dropped HolderV2()/GetPrototypeV2().
++#define PROPERTY_HOLDER(info) (info).Holder()
++#elif defined(V8_MAJOR_VERSION) && V8_MAJOR_VERSION >= 13
+ #define PROPERTY_HOLDER(info) (info).HolderV2()
+ #else
+ #define PROPERTY_HOLDER(info) (info).This()
+@@ -27,7 +30,14 @@
+ #define EasyIsolate v8::Isolate* isolate = v8::Isolate::GetCurrent()
+ #define OnlyIsolate info.GetIsolate()
+ #define OnlyContext isolate->GetCurrentContext()
++#if defined(V8_MAJOR_VERSION) && V8_MAJOR_VERSION >= 15
++// V8 15: External pointers carry a type tag.
++#define OnlyAddon static_cast<Addon*>(info.Data().As<v8::External>()->Value(v8::kExternalPointerTypeTagDefault))
++#define NEW_EXTERNAL(isolate, ptr) v8::External::New(isolate, ptr, v8::kExternalPointerTypeTagDefault)
++#else
+ #define OnlyAddon static_cast<Addon*>(info.Data().As<v8::External>()->Value())
++#define NEW_EXTERNAL(isolate, ptr) v8::External::New(isolate, ptr)
++#endif
+ #define UseIsolate v8::Isolate* isolate = OnlyIsolate
+ #define UseContext v8::Local<v8::Context> ctx = OnlyContext
+ #define UseAddon Addon* addon = OnlyAddon

@@ -123,16 +123,31 @@ step "Rebuilding better-sqlite3-multiple-ciphers for Linux"
 # npm builds do not have it, so dropping in a stock prebuilt binary gets you a
 # window that dies with "r.updateHook is not a function".
 #
-# Their full C++ source is inside app.asar.unpacked, so build *that*. Only
-# binding.gyp is missing from the bundle; take it from the matching npm release.
+# Older Granola bundles carried the fork's full C++ source in
+# app.asar.unpacked (only binding.gyp was missing). Newer ones (7.749+) ship only
+# a macOS binary, so we build upstream from npm and apply
+# patches/better-sqlite3-updatehook.patch, which re-adds updateHook() on top of
+# sqlite3_update_hook() and a few V8 15 API fixes for Electron 45+.
 BS3="$INSTALL_DIR/resources/app.asar.unpacked/node_modules/better-sqlite3-multiple-ciphers"
 BS3_VER="$(node -p "require('$BS3/package.json').version")"
-info "building Granola's fork of v$BS3_VER from source"
+PATCH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/patches/better-sqlite3-updatehook.patch"
 
-cp -r "$BS3" "$WORK/bs3"
-( cd "$WORK" && npm pack "better-sqlite3-multiple-ciphers@$BS3_VER" --silent >/dev/null \
-    && tar xzf better-sqlite3-multiple-ciphers-*.tgz ) || die "could not fetch binding.gyp from npm"
-cp "$WORK/package/binding.gyp" "$WORK/bs3/"
+if [[ -d "$BS3/src" ]]; then
+  info "building Granola's fork of v$BS3_VER from the bundled source"
+  cp -r "$BS3" "$WORK/bs3"
+  ( cd "$WORK" && npm pack "better-sqlite3-multiple-ciphers@$BS3_VER" --silent >/dev/null \
+      && tar xzf better-sqlite3-multiple-ciphers-*.tgz ) || die "could not fetch binding.gyp from npm"
+  cp "$WORK/package/binding.gyp" "$WORK/bs3/"
+else
+  command -v patch >/dev/null || die "'patch' not found. Please install it."
+  [[ -f "$PATCH" ]] || die "missing $PATCH"
+  info "bundle has no C++ source; building upstream v$BS3_VER from npm + updateHook patch"
+  ( cd "$WORK" && npm pack "better-sqlite3-multiple-ciphers@$BS3_VER" --silent >/dev/null \
+      && tar xzf better-sqlite3-multiple-ciphers-*.tgz ) || die "could not fetch better-sqlite3-multiple-ciphers@$BS3_VER from npm"
+  mv "$WORK/package" "$WORK/bs3"
+  ( cd "$WORK/bs3" && patch -p1 < "$PATCH" >/dev/null ) \
+    || die "updateHook patch does not apply to v$BS3_VER; it needs updating"
+fi
 
 ( cd "$WORK/bs3" && CC="$CC" CXX="$CXX" npx --yes node-gyp rebuild --release \
     --runtime=electron --target="$EL_VER" --arch=x64 \
@@ -185,9 +200,11 @@ ELECTRON_RUN_AS_NODE=1 NODE_PATH="$INSTALL_DIR/resources/app.asar/node_modules" 
     db.prepare('INSERT INTO t VALUES (1)').run();
     if (db.prepare('SELECT count(*) c FROM t').get().c !== 1) throw new Error('insert failed');
     if (!fired) throw new Error('updateHook did not fire');
+    // The renderer asks SQLite which tables a query touches (needs SQLITE_ENABLE_BYTECODE_VTAB).
+    if (db.prepare('SELECT count(*) c FROM tables_used(?)').get('SELECT * FROM t').c < 1) throw new Error('tables_used() unavailable');
     db.close();
   " || die "smoke test failed, the app would not start"
-info "encrypted database + updateHook both work"
+info "encrypted database, updateHook and tables_used() all work"
 
 printf '\n\033[32m✓ Granola %s is installed.\033[0m\n' "$APP_VER"
 printf '  Launch it from your application menu, or run:\n    %s\n\n' "$INSTALL_DIR/granola.sh"
