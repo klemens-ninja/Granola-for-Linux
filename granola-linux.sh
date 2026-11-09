@@ -116,6 +116,20 @@ print(f"    rewrote {total} platform fallback(s)")
 PYEOF
 
 
+step "Stubbing the native drag plugin"
+
+# electron-click-drag-plugin's Linux build talks raw Xlib (XSendEvent on the
+# window handle). Under Wayland the handle is not an X11 window id, Xlib's
+# default error handler calls exit(), and the whole app dies the moment you
+# click the floating "nub" overlay icon during a meeting. Replace it with a
+# no-op: the nub just cannot be dragged on Linux.
+cat > "$INSTALL_DIR/resources/app.asar.unpacked/node_modules/electron-click-drag-plugin/index.js" <<'JSEOF'
+// Linux stub, see granola-linux.sh. The real plugin aborts the process on Wayland.
+module.exports = { startDrag() {}, default: { startDrag() {} } };
+JSEOF
+info "drag plugin replaced with a no-op"
+
+
 step "Rebuilding better-sqlite3-multiple-ciphers for Linux"
 
 # Granola ships a *patched* fork of better-sqlite3-multiple-ciphers: it adds an
