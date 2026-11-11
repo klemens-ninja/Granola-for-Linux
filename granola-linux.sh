@@ -116,18 +116,34 @@ print(f"    rewrote {total} platform fallback(s)")
 PYEOF
 
 
-step "Stubbing the native drag plugin"
+step "Guarding the native drag plugin"
 
 # electron-click-drag-plugin's Linux build talks raw Xlib (XSendEvent on the
-# window handle). Under Wayland the handle is not an X11 window id, Xlib's
-# default error handler calls exit(), and the whole app dies the moment you
-# click the floating "nub" overlay icon during a meeting. Replace it with a
-# no-op: the nub just cannot be dragged on Linux.
-cat > "$INSTALL_DIR/resources/app.asar.unpacked/node_modules/electron-click-drag-plugin/index.js" <<'JSEOF'
-// Linux stub, see granola-linux.sh. The real plugin aborts the process on Wayland.
-module.exports = { startDrag() {}, default: { startDrag() {} } };
+# window handle). Under native Wayland the handle is not an X11 window id,
+# Xlib's default error handler calls exit(), and the whole app dies the moment
+# you click the floating "nub" overlay icon during a meeting. Keep the real
+# plugin as drag-real.js and load it only when running on X11/XWayland
+# (granola.sh starts Electron with --ozone-platform=x11); otherwise no-op.
+DRAG="$INSTALL_DIR/resources/app.asar.unpacked/node_modules/electron-click-drag-plugin"
+cat > "$DRAG/drag-real.js" <<'JSEOF'
+module.exports = require('./build/Release/linux-x64/drag.node');
 JSEOF
-info "drag plugin replaced with a no-op"
+cat > "$DRAG/index.js" <<'JSEOF'
+// Linux wrapper, see granola-linux.sh. The real plugin does raw Xlib calls and
+// aborts the whole process when the window handle is not an X11 window id
+// (native Wayland). Load it only when running on X11/XWayland, else no-op.
+const noop = { startDrag() {}, default: { startDrag() {} } };
+if (process.argv.includes('--ozone-platform=x11')) {
+  try {
+    module.exports = require('./drag-real.js');
+  } catch (e) {
+    module.exports = noop;
+  }
+} else {
+  module.exports = noop;
+}
+JSEOF
+info "drag plugin guarded"
 
 
 step "Rebuilding better-sqlite3-multiple-ciphers for Linux"
@@ -177,7 +193,12 @@ step "Installing launcher and desktop entry"
 cat > "$INSTALL_DIR/granola.sh" <<EOF
 #!/usr/bin/env bash
 DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
-exec "\$DIR/electron" --ozone-platform-hint=auto "\$@"
+# x11 (XWayland on Wayland sessions) makes the floating nub draggable.
+# GRANOLA_OZONE=wayland runs natively, but then the nub cannot be dragged.
+if [ "\${GRANOLA_OZONE:-x11}" = "wayland" ]; then
+  exec "\$DIR/electron" --ozone-platform-hint=auto "\$@"
+fi
+exec "\$DIR/electron" --ozone-platform=x11 "\$@"
 EOF
 chmod +x "$INSTALL_DIR/granola.sh"
 
